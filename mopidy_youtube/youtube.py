@@ -1,6 +1,9 @@
 import importlib
 import json
 import os
+import threading
+import time
+from queue import Full
 from concurrent.futures.thread import ThreadPoolExecutor
 
 import pykka
@@ -27,7 +30,9 @@ musicapi_enabled = None
 musicapi_cookiefile = None
 youtube_dl = None
 youtube_dl_package = "youtube_dl"
-
+search_lock = threading.Lock()
+search_in_progress = False
+search_last_started = 0.0
 
 def async_property(func):
     """
@@ -46,7 +51,53 @@ def async_property(func):
         return self.__dict__[_future_name]
 
     return property(wrapper)
+    
+def is_live_item(item):
+    if not item:
+        return False
 
+    # jAPI / scrape search results often miss normal duration fields for lives
+    try:
+        if item.get("is_live"):
+            return True
+    except AttributeError:
+        pass
+
+    live_status = item.get("live_status")
+    if live_status in ("is_live", "is_upcoming", "post_live"):
+        return True
+
+    # Search-result heuristic: live results often lack normal duration metadata
+    content_details = item.get("contentDetails") or {}
+    duration = content_details.get("duration")
+    if duration in (None, "", "P0D", "PT0S"):
+        # only treat as suspicious if it's clearly a video search result
+        item_id = item.get("id")
+        if isinstance(item_id, dict) and item_id.get("kind") == "youtube#video":
+            snippet = item.get("snippet") or {}
+            # live search results often do not have channelId/length-like metadata
+            if "liveBroadcastContent" in snippet:
+                if snippet.get("liveBroadcastContent") != "none":
+                    return True
+
+    return False
+
+def is_live_info(info):
+    if not info:
+        return False
+
+    if info.get("is_live"):
+        return True
+
+    if info.get("live_status") in ("is_live", "is_upcoming", "post_live"):
+        return True
+
+    if info.get("duration") in (None, 0):
+        # last-resort heuristic
+        if info.get("was_live") or info.get("is_upcoming"):
+            return True
+
+    return False
 
 class Entry:
     """
@@ -86,40 +137,79 @@ class Entry:
 
     @classmethod
     def create_object(cls, item):
-        minimum_fields = ["title", "channel"]
-        if item["id"]["kind"] == "youtube#video":
-            obj = Video.get(item["id"]["videoId"])
-        elif item["id"]["kind"] == "youtube#playlist":
-            obj = Playlist.get(item["id"]["playlistId"])
+        if not item or "id" not in item or not isinstance(item["id"], dict):
+            return None
+
+        if is_live_item(item):
+            logger.info("Skipping live/upcoming YouTube search result: %s", item)
+            return None
+
+        kind = item["id"].get("kind")
+        if kind == "youtube#video":
+            video_id = item["id"].get("videoId")
+            if not video_id:
+                return None
+            obj = Video.get(video_id)
+        elif kind == "youtube#playlist":
+            playlist_id = item["id"].get("playlistId")
+            if not playlist_id:
+                return None
+            obj = Playlist.get(playlist_id)
         else:
-            obj = []
-            return obj
+            return None
+
+        minimum_fields = ["title", "channel"]
         item, extended_fields = cls.extend_fields(item, minimum_fields)
-        # extended_fields = minimum_fields
         obj._set_api_data(extended_fields, item)
         return obj
-
+    
     @classmethod
     def search(cls, q):
-        """
-        Search for both videos and playlists using a single API call. Fetches
-        title, thumbnails, channel. Depending on the API, may also fetch
-        length and video_count. The official youtube API will require an
-        additional API call to fetch length and video_count (taken care of
-        at Video.load_info and Playlist.load_info).
-        """
+        """Search for both videos and playlists using a single API call."""
+
+        global search_in_progress, search_last_started
+
+        q = (q or "").strip()
+        if not q:
+            logger.warning("youtube search skipped: empty query")
+            return []
+
+        with search_lock:
+            if search_in_progress:
+                logger.warning(
+                    'youtube search skipped while previous search is still running: "%s"',
+                    q,
+                )
+                return []
+
+            search_in_progress = True
+            search_last_started = time.monotonic()
+
         try:
-            data = cls.api.search(q)
-            if "error" in data:
-                raise Exception(data["error"])
-        except Exception as e:
-            logger.error('youtube search error "%s"', e)
-            return None
-        try:
-            return list(map(cls.create_object, data["items"]))
-        except Exception as e:
-            logger.error('map error "%s"', e)
-            return None
+            try:
+                data = cls.api.search(q)
+                if "error" in data:
+                    raise Exception(data["error"])
+            except Exception as e:
+                logger.exception('youtube search error for query "%s"', q)
+                return []
+
+            items = data.get("items", [])
+            results = []
+
+            for item in items:
+                try:
+                    obj = cls.create_object(item)
+                    if obj is not None:
+                        results.append(obj)
+                except Exception:
+                    logger.exception("map error while processing item: %r", item)
+
+            return results
+
+        finally:
+            with search_lock:
+                search_in_progress = False
 
     @classmethod
     def _add_futures(cls, futures_list, fields):
@@ -162,12 +252,6 @@ class Entry:
             if not future:
                 future = self.__dict__[_k] = pykka.ThreadingFuture()
 
-            # # What was this for?  Whatever it was for, it doesn't work
-            # # for pykka v4.3 onwards, since ThreadingFuture uses 
-            # # a condition variable instead of a queue
-            # if not future._queue.empty():  # hack, no public is_set()
-            #     continue
-
             if not item:
                 val = None
             elif k == "title":
@@ -179,10 +263,8 @@ class Entry:
             elif k == "album":
                 val = item["album"]
             elif k == "artists":
-                # val = [artist for artist in item["artists"] if artist["name"] not in ["Album", "Song"]]
                 val = item["artists"]
             elif k == "length":
-                # convert ISO8601 (PT1H2M10S) to s (3730)
                 val = ISO8601_to_seconds(item["contentDetails"]["duration"])
             elif k == "video_count":
                 val = min(
@@ -198,30 +280,50 @@ class Entry:
                     )
                     for (quality, details) in item["snippet"]["thumbnails"].items()
                     if quality in ["default", "medium", "high"]
-                ] or None  # is this "or None" necessary?
+                ] or None
             elif k == "channelId":
                 val = item["snippet"]["channelId"]
             elif k == "track_no":
                 val = item["track_no"]
-            future.set(val)
+            else:
+                continue
 
+            # Skip futures that already have a value
+            if hasattr(future, "_queue") and not future._queue.empty():
+                continue
+
+            try:
+                future.set(val)
+            except Full:
+                logger.debug(
+                    "Future already set for field %s on object %s, skipping",
+                    k,
+                    getattr(self, "id", None),
+                )
+                
     @classmethod
     def extend_fields(self, item, fields):
+        if not item:
+            return (None, list(set(fields)))
+
         extended_fields = set(fields)
-        if "snippet" in item:
-            if "channelId" in item["snippet"]:
-                extended_fields.add("channelId")
 
-            if "videoOwnerChannelTitle" in item["snippet"]:
-                extended_fields.add("owner_channel")
-            elif "channelTitle" in item["snippet"]:
-                extended_fields.add("channel")
-            else:
-                logger.warn(f"no channel or owner_channel {item}")
-                item["snippet"]["channelTitle"] = "unknown"
+        if "snippet" not in item or not isinstance(item["snippet"], dict):
+            item["snippet"] = {}
 
-            if "thumbnails" in item["snippet"]:
-                extended_fields.add("thumbnails")
+        if "channelId" in item["snippet"]:
+            extended_fields.add("channelId")
+
+        if "videoOwnerChannelTitle" in item["snippet"]:
+            extended_fields.add("owner_channel")
+        elif "channelTitle" in item["snippet"]:
+            extended_fields.add("channel")
+        else:
+            logger.warning("no channel or owner_channel for item: %r", item)
+            item["snippet"]["channelTitle"] = "unknown"
+
+        if "thumbnails" in item["snippet"]:
+            extended_fields.add("thumbnails")
 
         if "artists" in item:
             extended_fields.add("artists")
@@ -240,14 +342,14 @@ class Entry:
         if "track_no" in item:
             extended_fields.add("track_no")
 
-        if "contentDetails" in item:
+        if "contentDetails" in item and isinstance(item["contentDetails"], dict):
             if "duration" in item["contentDetails"]:
                 extended_fields.add("length")
             elif "itemCount" in item["contentDetails"]:
                 extended_fields.add("video_count")
+
         return (item, list(extended_fields))
-
-
+    
 class Video(Entry):
     total_bytes = 0
 
@@ -496,6 +598,20 @@ class Video(Entry):
                         fileUri = f"file://{(os.path.join(cache_location, cached[0]))}"
                         self._audio_url.set(fileUri)
                     else:
+                        with youtube_dl.YoutubeDL(ytdl_options) as ydl:
+                            probe_info = ydl.extract_info(
+                                **ytdl_extract_info_options,
+                                download=False,
+                            )
+
+                        if is_live_info(probe_info):
+                            logger.info(
+                                "Skipping YouTube live/upcoming playback resolution: %s",
+                                self.id,
+                            )
+                            self._audio_url.set(None)
+                            return
+
                         logger.debug(f"caching track {self.id}")
                         ytdl_options["outtmpl"] = os.path.join(
                             cache_location, "%(id)s.%(ext)s"
@@ -508,6 +624,14 @@ class Video(Entry):
                                 **ytdl_extract_info_options,
                                 download=True,
                             )
+
+                            if is_live_info(info):
+                                logger.info(
+                                    "Skipping YouTube live/upcoming playback resolution: %s",
+                                    self.id,
+                                )
+                                self._audio_url.set(None)
+                                return
 
                             # get info about audio format, for debugging
                             logger.debug(
@@ -598,6 +722,14 @@ class Video(Entry):
                             **ytdl_extract_info_options,
                             download=False,
                         )
+
+                        if is_live_info(info):
+                            logger.info(
+                                "Skipping YouTube live/upcoming playback resolution: %s",
+                                self.id,
+                            )
+                            self._audio_url.set(None)
+                            return
 
                         self._audio_url.set(info["url"])
 
